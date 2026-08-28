@@ -54,23 +54,14 @@ $dst = Join-Path ([Environment]::GetFolderPath("Desktop")) "KikiOS Tweaks"
 function DL {
     param($url, $dest, $lbl)
     Write-Host "  >> $lbl" -ForegroundColor Yellow
-    $wc = New-Object System.Net.WebClient
-    $script:dlDone = $false
-    $script:dlPct  = -1
-    $wc.DownloadProgressChanged += {
-        $p = $_.ProgressPercentage
-        if ($p -ne $script:dlPct) {
-            $script:dlPct = $p
-            $b = ("*" * [int](38 * $p / 100)).PadRight(38, ".")
-            Write-Host -NoNewline ("`r  [$b] " + $p.ToString().PadLeft(3) + "%  ")
-        }
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($url, $dest)
+        Write-Host "  ✔ Готово." -ForegroundColor Green
+        Write-Host ""
+    } catch {
+        throw $_
     }
-    $wc.DownloadFileCompleted += { $script:dlDone = $true }
-    $wc.DownloadFileAsync([uri]$url, $dest)
-    while (-not $script:dlDone) { Start-Sleep -Milliseconds 80 }
-    Write-Host ""
-    Write-Host "  ✔ Готово." -ForegroundColor Green
-    Write-Host ""
 }
 try { DL "https://www.7-zip.org/a/7zr.exe" $sz "Скачиваю 7-Zip..." }
 catch {
@@ -97,10 +88,10 @@ if ($pr.ExitCode -ne 0) {
     exit
 }
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "  ✔ Готово." -ForegroundColor Green
+Write-Host "  ✔ Распаковка завершена." -ForegroundColor Green
 Write-Host ""
 Write-Host "  $ln" -ForegroundColor DarkGray
-$fin = "  ✦  Установка завершена!  ✦"
+$fin = "✦  Установка завершена!  ✦"
 Write-Host ((" " * [Math]::Max(0, [int](($w - $fin.Length) / 2))) + $fin) -ForegroundColor Green
 $sub = "Desktop\KikiOS Tweaks"
 Write-Host ((" " * [Math]::Max(0, [int](($w - $sub.Length) / 2))) + $sub) -ForegroundColor Cyan
