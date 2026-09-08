@@ -1,574 +1,685 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    KikiOS PCBOOST Edition installer.
 
-# --- configuration ---------------------------------------------------------
+.DESCRIPTION
+    Claude Code style terminal installer: downloads portable 7-Zip,
+    downloads the tweaks archive from GitHub Releases, extracts it to the
+    desktop and removes temporary files.
 
-$script:Config = @{
-    Title            = 'KikiOS Installer'
-    PanelLabel       = 'KikiOS Tweaks v2.0'
-    ExtractorUri     = 'https://www.7-zip.org/a/7zr.exe'
-    ArchiveUri       = 'https://github.com/f7707111-rgb/kikiOS/releases/download/v1.0/PCBOOST.7z'
-    DestinationName  = 'KikiOS Tweaks'
-    AccessCodeBase64 = 'TE5LP2c7KFlrcyRfVzQw'
-    MaxCodeAttempts  = 3
+    24-bit colors and the mascot animation require Windows 10+ (VT
+    sequences). Legacy consoles fall back to basic colors and a text spinner.
+#>
+
+Set-StrictMode -Version 2.0
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ $script:Config = @{
+    WindowTitle       = 'KikiOS Installer'
+    ProductName       = 'KikiOS'
+    Edition           = 'PCBOOST Edition'
+    Version           = '2.0.0'
+    SourceRepo        = '7707111-rgb/kikiOS'
+    SevenZipUrl       = 'https://www.7-zip.org/a/7zr.exe'
+    # TODO: paste the full release asset URL (it was truncated in the source script).
+    ArchiveUrl        = 'https://github.com/7707111-rgb/kikiOS/releases/download/v1.0/pcboost.7z'
+    ArchiveName       = 'pcboost.7z'
+    DestinationFolder = 'KikiOS Tweaks'
+    AccessCodeEncoded = 'TE5LP2c7KFlrcyRfVzQw'
+    MaxAccessAttempts = 3
 }
 
-$script:Esc = [char]27
-
-$script:Palette = @{
-    Accent    = '217;119;87'
-    AccentDim = '150;84;62'
-    Text      = '235;229;222'
-    Muted     = '134;134;134'
-    Success   = '132;186;120'
-    Danger    = '214;96;96'
+# Palette: hex values for hosts with 24-bit color support, console color
+# names as legacy fallback.
+ $script:HexColors = @{
+    Accent = 'D97757'   # Claude terracotta
+    Text   = 'F0EEE4'
+    Dim    = '9B968C'
+    Faint  = '5F5B53'
+    Error  = 'E5484D'
 }
 
-$script:Layout = @{
-    LeftWidth   = 28
-    RightWidth  = 33
-    StageHeight = 8
-    StageIndent = 4
+ $script:FallbackColors = @{
+    Accent = 'DarkYellow'
+    Text   = 'White'
+    Dim    = 'Gray'
+    Faint  = 'DarkGray'
+    Error  = 'Red'
 }
 
-# Mascot sprite: identical silhouette in every pose so the hop reads as motion.
-$script:MascotFrames = @{
-    Idle  = @(
-        ' ▄███████████▄ ',
-        ' ███▀▀▀▀▀▀▀███ ',
-        ' ██  █   █  ██ ',
-        ' ███▄▄▄▄▄▄▄███ ',
-        ' ▀▀█▀▀   ▀▀█▀▀ '
-    )
-    Blink = @(
-        ' ▄███████████▄ ',
-        ' ███▀▀▀▀▀▀▀███ ',
-        ' ██  ▄   ▄  ██ ',
-        ' ███▄▄▄▄▄▄▄███ ',
-        ' ▀▀█▀▀   ▀▀█▀▀ '
-    )
-    Hop   = @(
-        ' ▄███████████▄ ',
-        ' ███▀▀▀▀▀▀▀███ ',
-        ' ██  █   █  ██ ',
-        ' ███▄▄▄▄▄▄▄███ ',
-        ' ▀█▀▀     ▀▀█▀ '
-    )
-    Happy = @(
-        ' ▄███████████▄ ',
-        ' ███▀▀▀▀▀▀▀███ ',
-        ' ██  ▀   ▀  ██ ',
-        ' ███▄▄▄▄▄▄▄███ ',
-        ' ▀█▀▀     ▀▀█▀ '
-    )
+ $script:Esc           = [char]27
+ $script:AnsiColors    = @{}
+ $script:AnsiReset     = ''
+ $script:AnsiClearLine = ''
+ $script:VtEnabled     = $false
+
+ $script:Steps = @(
+    [pscustomobject]@{ Label = '7-Zip';   Status = 'Waiting' }
+    [pscustomobject]@{ Label = 'Archive'; Status = 'Waiting' }
+    [pscustomobject]@{ Label = 'Unpack';  Status = 'Waiting' }
+    [pscustomobject]@{ Label = 'Cleanup'; Status = 'Waiting' }
+)
+
+ $script:StatusLabels = @{
+    Waiting = 'waiting'
+    Running = 'running'
+    Done    = 'done'
+    Failed  = 'error'
 }
 
-$script:HopPattern = @(0, 1, 2, 2, 1, 0, 0, 0)
+ $script:StatusColors = @{
+    Waiting = 'Faint'
+    Running = 'Accent'
+    Done    = 'Text'
+    Failed  = 'Error'
+}
 
-# --- console primitives ----------------------------------------------------
+ $script:ActivityLog      = [System.Collections.Generic.List[object]]::new()
+ $script:CurrentStepIndex = -1
+
+ $script:SpinnerFrames   = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+ $script:MascotCycle     = @('Ground', 'Air', 'Ground', 'Air', 'Ground', 'Blink', 'Air', 'Ground')
+ $script:AnimationHeight = 8   # 7 mascot rows + 1 status row
+ $script:AnimationIndent = '    '
+
+# ---------------------------------------------------------------------------
+# Console initialization
+# ---------------------------------------------------------------------------
+
+function ConvertTo-AnsiForeground {
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{6}$')][string]$Hex)
+
+    $red   = [Convert]::ToInt32($Hex.Substring(0, 2), 16)
+    $green = [Convert]::ToInt32($Hex.Substring(2, 2), 16)
+    $blue  = [Convert]::ToInt32($Hex.Substring(4, 2), 16)
+    return ('{0}[38;2;{1};{2};{3}m' -f $script:Esc, $red, $green, $blue)
+}
 
 function Enable-VirtualTerminal {
-    try {
-        if (-not ('KikiOS.NativeConsole' -as [type])) {
-            Add-Type -Namespace 'KikiOS' -Name 'NativeConsole' -MemberDefinition @'
+    $signature = @'
 [DllImport("kernel32.dll", SetLastError = true)]
 public static extern IntPtr GetStdHandle(int nStdHandle);
 
 [DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);
 
 [DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);
 '@
-        }
-
-        $handle = [KikiOS.NativeConsole]::GetStdHandle(-11)
-        $mode = [uint32]0
-        if ([KikiOS.NativeConsole]::GetConsoleMode($handle, [ref]$mode)) {
-            [void][KikiOS.NativeConsole]::SetConsoleMode($handle, $mode -bor 0x0004)
-        }
-    }
-    catch [System.Exception] {
-        # Legacy hosts without VT support still print the layout, only colors degrade.
-    }
-}
-
-function Set-CursorVisible {
-    param([bool]$Visible)
 
     try {
-        [System.Console]::CursorVisible = $Visible
+        $native = Add-Type -MemberDefinition $signature -Name 'NativeConsoleApi' -Namespace 'KikiOS.Installer' -PassThru
+        $handle = $native::GetStdHandle(-11)
+        [int]$mode = 0
+        if (-not $native::GetConsoleMode($handle, [ref]$mode)) {
+            return $false
+        }
+        return [bool]$native::SetConsoleMode($handle, $mode -bor 0x0004)
+    }
+    catch [System.ComponentModel.Win32Exception] {
+        return $false
+    }
+    catch [System.InvalidOperationException] {
+        # Compiler unavailable for Add-Type on hardened hosts.
+        return $false
     }
     catch [System.Exception] {
-        # Redirected hosts do not expose a cursor.
+        # Virtual terminal support is best-effort; legacy path stays usable.
+        return $false
     }
 }
 
 function Initialize-Console {
-    $Host.UI.RawUI.WindowTitle = $script:Config.Title
+    try {
+        $Host.UI.RawUI.WindowTitle = $script:Config.WindowTitle
+    }
+    catch [System.Management.Automation.SetValueInvocationException] {
+        # Host forbids title changes; not critical.
+    }
 
     try {
-        [System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-        & chcp.com 65001 | Out-Null
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     }
-    catch [System.Exception] {
-        # Encoding switch is best effort.
-    }
-
-    Enable-VirtualTerminal
-    Clear-Host
-    Set-CursorVisible -Visible $false
-}
-
-function Format-Styled {
-    param(
-        [string]$Text,
-        [string]$ColorKey = 'Text'
-    )
-
-    "$($script:Esc)[38;2;$($script:Palette[$ColorKey])m$Text$($script:Esc)[0m"
-}
-
-function Write-Styled {
-    param(
-        [string]$Text = '',
-        [string]$ColorKey = 'Text',
-        [switch]$NoNewline
-    )
-
-    if ($NoNewline) {
-        Write-Host -NoNewline (Format-Styled -Text $Text -ColorKey $ColorKey)
-        return
+    catch [System.IO.IOException] {
+        # Legacy host without codepage switching; ASCII output stays readable.
     }
 
-    Write-Host (Format-Styled -Text $Text -ColorKey $ColorKey)
+    $script:VtEnabled = Enable-VirtualTerminal
+
+    if ($script:VtEnabled) {
+        foreach ($name in $script:HexColors.Keys) {
+            $script:AnsiColors[$name] = ConvertTo-AnsiForeground -Hex $script:HexColors[$name]
+        }
+        $script:AnsiReset     = ('{0}[0m' -f $script:Esc)
+        $script:AnsiClearLine = ('{0}[2K' -f $script:Esc)
+    }
 }
 
-function Format-Centered {
+function Test-ConsoleWidth {
+    try {
+        return ([Console]::WindowWidth -ge 70)
+    }
+    catch [System.IO.IOException] {
+        # No interactive console attached (e.g. ISE); skip the check.
+        return $true
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Output layer
+# ---------------------------------------------------------------------------
+
+function New-Segment {
     param(
-        [string]$Text,
-        [int]$Width
+        [Parameter(Mandatory)][string]$Text,
+        [ValidateSet('Accent', 'Text', 'Dim', 'Faint', 'Error')][string]$Color = 'Text'
+    )
+    return [pscustomobject]@{ Text = $Text; Color = $Color }
+}
+
+function Write-Segment {
+    param([Parameter(Mandatory)][pscustomobject]$Segment)
+
+    if ($script:VtEnabled) {
+        Write-Host -NoNewline ($script:AnsiColors[$Segment.Color] + $Segment.Text + $script:AnsiReset)
+    }
+    else {
+        Write-Host -NoNewline $Segment.Text -ForegroundColor $script:FallbackColors[$Segment.Color]
+    }
+}
+
+function Write-Segments {
+    param([pscustomobject[]]$Segments, [switch]$NoNewline)
+
+    foreach ($segment in $Segments) { Write-Segment -Segment $segment }
+    if (-not $NoNewline) { Write-Host '' }
+}
+
+function Add-RowPadding {
+    param([pscustomobject[]]$Segments, [Parameter(Mandatory)][int]$Width)
+
+    $visibleLength = 0
+    foreach ($segment in $Segments) { $visibleLength += $segment.Text.Length }
+
+    if ($visibleLength -ge $Width) { return $Segments }
+    return $Segments + (New-Segment (' ' * ($Width - $visibleLength)))
+}
+
+function Format-Padded {
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][int]$Width)
+
+    if ($Text.Length -ge $Width) { return $Text.Substring(0, $Width) }
+    return $Text.PadRight($Width)
+}
+
+# ---------------------------------------------------------------------------
+# Mascot
+# ---------------------------------------------------------------------------
+
+function Get-MascotBody {
+    return @(
+        ('  ' + ('▄' * 12) + '  ')
+        ('█' * 16)
+        '████  ████  ████'
+        '████  ████  ████'
+        ('█' * 16)
+        ' ██  ██  ██  ██ '
+    )
+}
+
+function Get-MascotFrame {
+    param([Parameter(Mandatory)][ValidateSet('Ground', 'Air', 'Blink')][string]$Name)
+
+    $body = Get-MascotBody
+
+    switch ($Name) {
+        'Air'   { return ($body + @('')) }
+        'Blink' {
+            $body[3] = '████▄▄████▄▄████'
+            return (@('') + $body)
+        }
+        default { return (@('') + $body) }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+function New-PanelTop {
+    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][int]$Width)
+
+    $dashCount = $Width - $Title.Length - 5
+    return @(
+        (New-Segment ('╭─ {0} ' -f $Title) 'Accent'),
+        (New-Segment ('─' * $dashCount) 'Accent'),
+        (New-Segment '╮' 'Accent')
+    )
+}
+
+function New-PanelBottom {
+    param([Parameter(Mandatory)][int]$Width)
+    return @((New-Segment ('╰' + ('─' * ($Width - 2)) + '╯') 'Accent'))
+}
+
+function New-StepRow {
+    param([Parameter(Mandatory)][pscustomobject]$Step, [Parameter(Mandatory)][int]$Width)
+
+    return @(
+        (New-Segment '│ ' 'Accent'),
+        (New-Segment (Format-Padded -Text $Step.Label -Width 12) 'Text'),
+        (New-Segment ($script:StatusLabels[$Step.Status].PadLeft($Width - 16)) $script:StatusColors[$Step.Status]),
+        (New-Segment ' │' 'Accent')
+    )
+}
+
+function New-InfoRow {
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][int]$Width)
+
+    return @(
+        (New-Segment '│ ' 'Accent'),
+        (New-Segment (Format-Padded -Text $Text -Width ($Width - 4)) 'Dim'),
+        (New-Segment ' │' 'Accent')
+    )
+}
+
+function New-DashboardLines {
+    $boxInnerWidth = 62
+    $leftWidth     = 26
+    $rightWidth    = 30
+    $rowCount      = 13
+
+    $title           = ('{0} · {1} v{2}' -f $script:Config.ProductName, $script:Config.Edition, $script:Config.Version)
+    $borderDashCount = $boxInnerWidth - $title.Length - 3
+
+    $topRow = @(
+        (New-Segment '╭─ ' 'Accent'),
+        (New-Segment $title 'Accent'),
+        (New-Segment (' ' + ('─' * $borderDashCount)) 'Accent'),
+        (New-Segment '╮' 'Accent')
     )
 
-    if ($Text.Length -ge $Width) {
-        return $Text.Substring(0, $Width)
+    $bottomRow = @((New-Segment ('╰' + ('─' * $boxInnerWidth) + '╯') 'Accent'))
+
+    # Left column: greeting, mascot, machine info.
+    $userName = $env:USERNAME
+    if ([string]::IsNullOrWhiteSpace($userName)) { $userName = 'unknown' }
+    $welcome = if ($userName.Length -le 9) { 'Welcome back, {0}!' -f $userName } else { 'Welcome back!' }
+
+    $leftLines = @()
+    $leftLines += ,@()
+    $leftLines += ,@(New-Segment ('  ' + $welcome) 'Text')
+    $leftLines += ,@()
+    foreach ($line in (Get-MascotBody)) {
+        $leftLines += ,@(New-Segment ('     ' + $line) 'Accent')
+    }
+    $leftLines += ,@()
+    $leftLines += ,@(New-Segment ('  User:  ' + $userName) 'Dim')
+    $leftLines += ,@(New-Segment ('  PC:    ' + $env:COMPUTERNAME) 'Dim')
+    $leftLines += ,@()
+
+    # Right column: setup steps and info panels.
+    $rightLines = @()
+    $rightLines += ,@()
+    $rightLines += ,(New-PanelTop -Title 'Setup' -Width $rightWidth)
+    foreach ($step in $script:Steps) {
+        $rightLines += ,(New-StepRow -Step $step -Width $rightWidth)
+    }
+    $rightLines += ,(New-PanelBottom -Width $rightWidth)
+    $rightLines += ,@()
+    $rightLines += ,(New-PanelTop -Title 'Info' -Width $rightWidth)
+
+    $infoLines = @(
+        ('v{0} · {1}' -f $script:Config.Version, $script:Config.Edition)
+        ('· {0}' -f $script:Config.SourceRepo)
+        ('Desktop\{0}' -f $script:Config.DestinationFolder)
+    )
+    foreach ($infoLine in $infoLines) {
+        $rightLines += ,(New-InfoRow -Text $infoLine -Width $rightWidth)
+    }
+    $rightLines += ,(New-PanelBottom -Width $rightWidth)
+
+    $rows = @()
+    $edgeLeft  = @((New-Segment '│' 'Accent'), (New-Segment '  ' 'Text'))
+    $gap       = @((New-Segment '  ' 'Text'))
+    $edgeRight = @((New-Segment '  ' 'Text'), (New-Segment '│' 'Accent'))
+
+    for ($i = 0; $i -lt $rowCount; $i++) {
+        $leftCell  = Add-RowPadding -Segments $leftLines[$i]  -Width $leftWidth
+        $rightCell = Add-RowPadding -Segments $rightLines[$i] -Width $rightWidth
+        $rows += ,($edgeLeft + $leftCell + $gap + $rightCell + $gap + $edgeRight)
     }
 
-    $leftPad = [math]::Floor(($Width - $Text.Length) / 2)
-    (' ' * $leftPad) + $Text + (' ' * ($Width - $Text.Length - $leftPad))
-}
-
-function New-Cell {
-    param(
-        [string]$Text = '',
-        [string]$ColorKey = 'Text'
-    )
-
-    [pscustomobject]@{ Text = $Text; ColorKey = $ColorKey; Kind = 'Text' }
-}
-
-function New-DividerCell {
-    [pscustomobject]@{ Text = ''; ColorKey = 'AccentDim'; Kind = 'Divider' }
-}
-
-# --- panel rendering -------------------------------------------------------
-
-function Write-PanelTop {
-    param([string]$Label)
-
-    $leftSpan = $script:Layout.LeftWidth + 2
-    $rightSpan = $script:Layout.RightWidth + 2
-    $fillLength = [math]::Max(0, $leftSpan - ("─ $Label ").Length)
-
-    Write-Styled -Text '╭─ ' -ColorKey 'AccentDim' -NoNewline
-    Write-Styled -Text $Label -ColorKey 'Accent' -NoNewline
-    Write-Styled -Text (' ' + ('─' * $fillLength)) -ColorKey 'AccentDim' -NoNewline
-    Write-Styled -Text ('┬' + ('─' * $rightSpan) + '╮') -ColorKey 'AccentDim'
-}
-
-function Write-PanelBottom {
-    $border = '╰' + ('─' * ($script:Layout.LeftWidth + 2)) + '┴' + ('─' * ($script:Layout.RightWidth + 2)) + '╯'
-    Write-Styled -Text $border -ColorKey 'AccentDim'
-}
-
-function Write-PanelRow {
-    param(
-        [pscustomobject]$Left,
-        [pscustomobject]$Right
-    )
-
-    $middleBorder = if ($Right.Kind -eq 'Divider') { '├' } else { '│' }
-
-    Write-Styled -Text '│ ' -ColorKey 'AccentDim' -NoNewline
-    Write-Styled -Text $Left.Text.PadRight($script:Layout.LeftWidth) -ColorKey $Left.ColorKey -NoNewline
-    Write-Styled -Text " $middleBorder " -ColorKey 'AccentDim' -NoNewline
-
-    if ($Right.Kind -eq 'Divider') {
-        Write-Styled -Text (('─' * ($script:Layout.RightWidth + 1)) + '┤') -ColorKey 'AccentDim'
-        return
-    }
-
-    Write-Styled -Text $Right.Text.PadRight($script:Layout.RightWidth) -ColorKey $Right.ColorKey -NoNewline
-    Write-Styled -Text ' │' -ColorKey 'AccentDim'
-}
-
-function Get-LeftColumn {
-    param(
-        [string]$UserName,
-        [string]$DestinationPath
-    )
-
-    $width = $script:Layout.LeftWidth
-    $rows = New-Object System.Collections.Generic.List[object]
-
-    $rows.Add((New-Cell))
-    $rows.Add((New-Cell -Text (Format-Centered -Text "Welcome back, $UserName!" -Width $width) -ColorKey 'Text'))
-    $rows.Add((New-Cell))
-
-    foreach ($spriteLine in $script:MascotFrames.Idle) {
-        $rows.Add((New-Cell -Text (Format-Centered -Text $spriteLine -Width $width) -ColorKey 'Accent'))
-    }
-
-    $rows.Add((New-Cell))
-    $rows.Add((New-Cell -Text (Format-Centered -Text 'PCBOOST Edition' -Width $width) -ColorKey 'Muted'))
-    $rows.Add((New-Cell -Text (Format-Centered -Text $DestinationPath -Width $width) -ColorKey 'Muted'))
-
-    $rows
-}
-
-function Get-RightColumn {
-    param(
-        [string]$UserName,
-        [string]$MachineName
-    )
-
-    $rows = New-Object System.Collections.Generic.List[object]
-
-    $rows.Add((New-Cell -Text 'What happens next' -ColorKey 'Accent'))
-    $rows.Add((New-Cell -Text '1  Fetch portable 7-Zip' -ColorKey 'Text'))
-    $rows.Add((New-Cell -Text '2  Fetch the tweak archive' -ColorKey 'Text'))
-    $rows.Add((New-Cell -Text '3  Unpack onto your Desktop' -ColorKey 'Text'))
-    $rows.Add((New-Cell -Text '4  Sweep every temporary file' -ColorKey 'Muted'))
-    $rows.Add((New-DividerCell))
-    $rows.Add((New-Cell -Text 'This machine' -ColorKey 'Accent'))
-    $rows.Add((New-Cell -Text ('User      ' + $UserName) -ColorKey 'Text'))
-    $rows.Add((New-Cell -Text ('Computer  ' + $MachineName) -ColorKey 'Text'))
-    $rows.Add((New-Cell -Text ('Shell     PowerShell ' + $PSVersionTable.PSVersion) -ColorKey 'Muted'))
-    $rows.Add((New-Cell -Text ('Target    Desktop\' + $script:Config.DestinationName) -ColorKey 'Muted'))
-
-    $rows
+    $allRows = @($topRow) + $rows + @($bottomRow)
+    return ,$allRows
 }
 
 function Show-Dashboard {
-    param(
-        [string]$UserName,
-        [string]$MachineName,
-        [string]$DestinationPath
-    )
-
-    $left = Get-LeftColumn -UserName $UserName -DestinationPath $DestinationPath
-    $right = Get-RightColumn -UserName $UserName -MachineName $MachineName
-    $rowCount = [math]::Max($left.Count, $right.Count)
-
+    Clear-Host
     Write-Host ''
-    Write-PanelTop -Label $script:Config.PanelLabel
 
-    for ($index = 0; $index -lt $rowCount; $index++) {
-        $leftCell = if ($index -lt $left.Count) { $left[$index] } else { New-Cell }
-        $rightCell = if ($index -lt $right.Count) { $right[$index] } else { New-Cell }
-        Write-PanelRow -Left $leftCell -Right $rightCell
-        Start-Sleep -Milliseconds 45
-    }
-
-    Write-PanelBottom
+    foreach ($row in (New-DashboardLines)) { Write-Segments -Segments $row }
     Write-Host ''
+
+    foreach ($entry in $script:ActivityLog) { Write-Segments -Segments $entry }
 }
 
-function Write-Notice {
+function Set-StepStatus {
     param(
-        [string]$Message,
-        [string]$ColorKey = 'Accent'
+        [Parameter(Mandatory)][ValidateRange(0, 3)][int]$Index,
+        [Parameter(Mandatory)][ValidateSet('Waiting', 'Running', 'Done', 'Failed')][string]$Status,
+        [switch]$SkipRender
     )
 
-    $innerWidth = $Message.Length + 2
-
-    Write-Styled -Text ('╭' + ('─' * $innerWidth) + '╮') -ColorKey $ColorKey
-    Write-Styled -Text '│ ' -ColorKey $ColorKey -NoNewline
-    Write-Styled -Text $Message -ColorKey 'Text' -NoNewline
-    Write-Styled -Text ' │' -ColorKey $ColorKey
-    Write-Styled -Text ('╰' + ('─' * $innerWidth) + '╯') -ColorKey $ColorKey
+    $script:Steps[$Index].Status = $Status
+    $script:CurrentStepIndex     = $Index
+    if (-not $SkipRender) { Show-Dashboard }
 }
 
-# --- mascot narration ------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Animated work block (mascot hop + spinner)
+# ---------------------------------------------------------------------------
 
-function Show-MascotLine {
+function Write-AnimationFrame {
     param(
-        [string]$Message,
-        [string]$ColorKey = 'Text',
-        [int]$CharacterDelayMs = 14
+        [Parameter(Mandatory)][string[]]$MascotLines,
+        [Parameter(Mandatory)][string]$SpinnerChar,
+        [Parameter(Mandatory)][string]$Activity,
+        [Parameter(Mandatory)][bool]$IsFirstRender
     )
 
-    Write-Styled -Text (' ' * $script:Layout.StageIndent) -NoNewline
-    Write-Styled -Text '(█ █) ' -ColorKey 'Accent' -NoNewline
-
-    foreach ($character in $Message.ToCharArray()) {
-        Write-Styled -Text ([string]$character) -ColorKey $ColorKey -NoNewline
-        if ($CharacterDelayMs -gt 0) {
-            Start-Sleep -Milliseconds $CharacterDelayMs
+    if ($script:VtEnabled) {
+        if (-not $IsFirstRender) {
+            [Console]::Write(('{0}[{1}A' -f $script:Esc, $script:AnimationHeight))
         }
+        foreach ($line in $MascotLines) {
+            [Console]::Write("`r" + $script:AnsiClearLine + $script:AnsiColors['Accent'] + $script:AnimationIndent + $line + $script:AnsiReset + "`r`n")
+        }
+        [Console]::Write("`r" + $script:AnsiClearLine + $script:AnsiColors['Accent'] + $script:AnimationIndent + $SpinnerChar + ' ' + $script:AnsiColors['Text'] + $Activity + $script:AnsiReset)
     }
-
-    Write-Host ''
+    else {
+        Write-Host -NoNewline ("`r{0}{1} {2}   " -f $script:AnimationIndent, $SpinnerChar, $Activity) -ForegroundColor $script:FallbackColors['Accent']
+    }
 }
 
-function Start-MascotStage {
-    for ($index = 0; $index -lt $script:Layout.StageHeight; $index++) {
-        Write-Host ''
+function Clear-AnimationBlock {
+    if (-not $script:VtEnabled) { return }
+
+    [Console]::Write(('{0}[{1}A' -f $script:Esc, $script:AnimationHeight))
+    for ($i = 0; $i -lt $script:AnimationHeight - 1; $i++) {
+        [Console]::Write("`r" + $script:AnsiClearLine + "`r`n")
     }
+    [Console]::Write("`r" + $script:AnsiClearLine)
 }
 
-function Update-MascotStage {
+function Wait-AnimatedWork {
     param(
-        [int]$HopOffset = 0,
-        [string]$FrameKey = 'Idle',
-        [string]$Speech = '',
-        [string]$SpeechColorKey = 'Text'
+        [Parameter(Mandatory)][ScriptBlock]$IsBusy,
+        [Parameter(Mandatory)][string]$Activity
     )
 
-    $indent = ' ' * $script:Layout.StageIndent
-    $rows = New-Object System.Collections.Generic.List[object]
+    $frameIndex    = 0
+    $isFirstRender = $true
+    $hasRendered   = $false
 
-    for ($index = 0; $index -lt (2 - $HopOffset); $index++) {
-        $rows.Add((New-Cell))
+    while (& $IsBusy) {
+        $frameName   = $script:MascotCycle[$frameIndex % $script:MascotCycle.Count]
+        $spinnerChar = $script:SpinnerFrames[$frameIndex % $script:SpinnerFrames.Count]
+
+        Write-AnimationFrame -MascotLines (Get-MascotFrame -Name $frameName) `
+            -SpinnerChar $spinnerChar -Activity $Activity -IsFirstRender $isFirstRender
+
+        $isFirstRender = $false
+        $hasRendered   = $true
+        $frameIndex++
+        Start-Sleep -Milliseconds 130
     }
 
-    foreach ($spriteLine in $script:MascotFrames[$FrameKey]) {
-        $rows.Add((New-Cell -Text ($indent + $spriteLine) -ColorKey 'Accent'))
-    }
-
-    for ($index = 0; $index -lt $HopOffset; $index++) {
-        $rows.Add((New-Cell))
-    }
-
-    $rows.Add((New-Cell -Text ($indent + '"' + $Speech + '"') -ColorKey $SpeechColorKey))
-
-    Write-Host -NoNewline ("$($script:Esc)[{0}A" -f $script:Layout.StageHeight)
-    foreach ($row in $rows) {
-        Write-Host -NoNewline "$($script:Esc)[2K"
-        Write-Styled -Text $row.Text -ColorKey $row.ColorKey
-    }
+    if ($hasRendered) { Clear-AnimationBlock }
 }
 
-function Wait-WithMascot {
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+function Format-StepDuration {
+    param([Parameter(Mandatory)][System.Diagnostics.Stopwatch]$Stopwatch)
+
+    $seconds = $Stopwatch.Elapsed.TotalSeconds
+    return ('{0}s' -f $seconds.ToString('F1', [System.Globalization.CultureInfo]::InvariantCulture))
+}
+
+function Invoke-DownloadStep {
     param(
-        [Parameter(Mandatory = $true)][scriptblock]$IsCompleted,
-        [Parameter(Mandatory = $true)][string[]]$SpeechLines,
-        [Parameter(Mandatory = $true)][string]$DoneSpeech
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$Activity
     )
 
-    $frame = 0
-    while (-not (& $IsCompleted)) {
-        $hopOffset = $script:HopPattern[$frame % $script:HopPattern.Length]
-        $frameKey = if ($hopOffset -gt 0) { 'Hop' } elseif ($frame % 17 -eq 0) { 'Blink' } else { 'Idle' }
-        $speech = $SpeechLines[[math]::Floor($frame / 14) % $SpeechLines.Length]
-
-        Update-MascotStage -HopOffset $hopOffset -FrameKey $frameKey -Speech $speech
-        $frame++
-        Start-Sleep -Milliseconds 90
-    }
-
-    Update-MascotStage -HopOffset 0 -FrameKey 'Happy' -Speech $DoneSpeech -SpeechColorKey 'Success'
-}
-
-# --- installer steps -------------------------------------------------------
-
-function Test-AccessCode {
-    param([Parameter(Mandatory = $true)][System.Security.SecureString]$Secret)
-
-    $expected = [System.Text.Encoding]::UTF8.GetString(
-        [System.Convert]::FromBase64String($script:Config.AccessCodeBase64))
-    $pointer = [System.IntPtr]::Zero
-
+    $client    = New-Object System.Net.WebClient
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
-        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-        return [string]::Equals($plainText, $expected, [System.StringComparison]::Ordinal)
+        $task = $client.DownloadFileTaskAsync($Url, $DestinationPath)
+        Wait-AnimatedWork -IsBusy { -not $task.IsCompleted } -Activity $Activity
+
+        if ($task.IsFaulted) { throw $task.Exception.InnerException }
+        if ($task.IsCanceled) { throw [System.OperationCanceledException]::new('Download was cancelled.') }
     }
     finally {
-        if ($pointer -ne [System.IntPtr]::Zero) {
-            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-        }
+        $client.Dispose()
+        $stopwatch.Stop()
     }
+
+    return (Format-StepDuration -Stopwatch $stopwatch)
+}
+
+function Invoke-ExtractionStep {
+    param(
+        [Parameter(Mandatory)][string]$SevenZipPath,
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$LogDirectory,
+        [Parameter(Mandatory)][string]$Activity
+    )
+
+    if (-not (Test-Path -LiteralPath $DestinationPath)) {
+        New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+    }
+
+    # Redirect 7-Zip output to files so it does not corrupt the animation.
+    $arguments     = 'x "{0}" -o"{1}" -y' -f $ArchivePath, $DestinationPath
+    $stdoutLogPath = Join-Path $LogDirectory '7z-stdout.log'
+    $stderrLogPath = Join-Path $LogDirectory '7z-stderr.log'
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = Start-Process -FilePath $SevenZipPath -ArgumentList $arguments `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath
+
+    Wait-AnimatedWork -IsBusy { -not $process.HasExited } -Activity $Activity
+    $stopwatch.Stop()
+
+    if ($process.ExitCode -ne 0) {
+        throw ('7-Zip exited with code {0}' -f $process.ExitCode)
+    }
+
+    return (Format-StepDuration -Stopwatch $stopwatch)
+}
+
+# ---------------------------------------------------------------------------
+# Access code
+# ---------------------------------------------------------------------------
+
+function ConvertFrom-SecureStringToPlain {
+    param([Parameter(Mandatory)][System.Security.SecureString]$SecureString)
+
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function Test-AccessCode {
+    param([Parameter(Mandatory)][string]$Code)
+
+    $expected = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($script:Config.AccessCodeEncoded))
+    return ($Code -ceq $expected)
 }
 
 function Request-AccessCode {
-    Show-MascotLine -Message 'Drop the access code and I will handle the boring parts.'
-    Write-Host ''
+    param([Parameter(Mandatory)][ValidateRange(1, 10)][int]$MaxAttempts)
 
-    for ($attempt = 1; $attempt -le $script:Config.MaxCodeAttempts; $attempt++) {
-        Write-Styled -Text (' ' * $script:Layout.StageIndent) -NoNewline
-        Write-Styled -Text 'Access code: ' -ColorKey 'Accent' -NoNewline
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Show-Dashboard
 
-        Set-CursorVisible -Visible $true
-        $secret = Read-Host -AsSecureString
-        Set-CursorVisible -Visible $false
+        Write-Segments -Segments @(
+            (New-Segment '  > ' 'Text'),
+            (New-Segment 'enter access code ' 'Dim'),
+            (New-Segment ('({0} left)' -f ($MaxAttempts - $attempt + 1)) 'Faint')
+        ) -NoNewline
 
-        if (Test-AccessCode -Secret $secret) {
-            Write-Host ''
-            Show-MascotLine -Message 'Code accepted. Sit back, I am on it.' -ColorKey 'Success'
+        $secureCode = Read-Host -AsSecureString
+        $plainCode  = ConvertFrom-SecureStringToPlain -SecureString $secureCode
+
+        if (Test-AccessCode -Code $plainCode) {
+            Write-Segments -Segments @(
+                (New-Segment '  ✔ ' 'Accent'),
+                (New-Segment 'access granted' 'Text')
+            )
+            Start-Sleep -Milliseconds 700
             return $true
         }
 
-        $remaining = $script:Config.MaxCodeAttempts - $attempt
-        Write-Host ''
-        Show-MascotLine -Message "That is not it. Tries left: $remaining" -ColorKey 'Danger'
+        $attemptsLeft = $MaxAttempts - $attempt
+        $wrongText = if ($attemptsLeft -gt 0) { 'wrong code, {0} attempts left' -f $attemptsLeft } else { 'wrong code' }
+        Write-Segments -Segments @(
+            (New-Segment '  ✖ ' 'Error'),
+            (New-Segment $wrongText 'Error')
+        )
     }
 
     return $false
 }
 
-function Invoke-MonitoredDownload {
-    param(
-        [Parameter(Mandatory = $true)][uri]$Uri,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string[]]$SpeechLines,
-        [Parameter(Mandatory = $true)][string]$DoneSpeech
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+function Add-ActivityEntry {
+    param([Parameter(Mandatory)][pscustomobject[]]$Segments)
+
+    $script:ActivityLog.Add($Segments)
+    Show-Dashboard
+}
+
+function Add-SuccessEntry {
+    param([Parameter(Mandatory)][string]$Message, [AllowEmptyString()][string]$Duration = '')
+
+    $segments = [System.Collections.Generic.List[pscustomobject]]::new()
+    $segments.Add((New-Segment '  ✔ ' 'Accent'))
+    $segments.Add((New-Segment $Message 'Text'))
+    if ($Duration -ne '') {
+        $segments.Add((New-Segment (' · {0}' -f $Duration) 'Faint'))
+    }
+    Add-ActivityEntry -Segments $segments.ToArray()
+}
+
+function Add-SummaryEntry {
+    param([Parameter(Mandatory)][string]$Message)
+
+    Add-ActivityEntry -Segments @(
+        (New-Segment '  ✦ ' 'Accent'),
+        (New-Segment $Message 'Text')
     )
-
-    $client = New-Object System.Net.WebClient
-    try {
-        $downloadTask = $client.DownloadFileTaskAsync($Uri, $Destination)
-        Wait-WithMascot -IsCompleted { $downloadTask.IsCompleted } -SpeechLines $SpeechLines -DoneSpeech $DoneSpeech
-
-        if ($downloadTask.IsFaulted) {
-            throw $downloadTask.Exception.GetBaseException()
-        }
-    }
-    finally {
-        $client.Dispose()
-    }
 }
 
-function Expand-TweakArchive {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExtractorPath,
-        [Parameter(Mandatory = $true)][string]$ArchivePath,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string[]]$SpeechLines,
-        [Parameter(Mandatory = $true)][string]$DoneSpeech
-    )
-
-    if (-not (Test-Path -LiteralPath $Destination)) {
-        New-Item -ItemType Directory -Path $Destination | Out-Null
-    }
-
-    $arguments = @('x', ('"' + $ArchivePath + '"'), ('-o"' + $Destination + '"'), '-y')
-    $process = Start-Process -FilePath $ExtractorPath -ArgumentList $arguments -NoNewWindow -PassThru
-
-    Wait-WithMascot -IsCompleted { $process.HasExited } -SpeechLines $SpeechLines -DoneSpeech $DoneSpeech
-
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) {
-        throw [System.InvalidOperationException]::new("Extraction failed with exit code $($process.ExitCode).")
-    }
+function Wait-ExitKey {
+    Write-Segments -Segments @(
+        (New-Segment '  > ' 'Text'),
+        (New-Segment 'press Enter to exit' 'Dim')
+    ) -NoNewline
+    [void][System.Console]::ReadLine()
 }
 
-function Remove-WorkingDirectory {
-    param([string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force
-    }
-    catch [System.IO.IOException] {
-        # A locked temp file is not worth failing the install over.
-    }
-}
-
-function Wait-ForExitKey {
-    Write-Host ''
-    Show-MascotLine -Message 'Press Enter and I will get out of your way.' -ColorKey 'Muted'
-    Set-CursorVisible -Visible $true
-    [void](Read-Host)
-}
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 function Invoke-Installer {
-    $workingDirectory = $null
+    Initialize-Console
+
+    if (-not (Test-ConsoleWidth)) {
+        Add-ActivityEntry -Segments @(
+            (New-Segment '  !  ' 'Accent'),
+            (New-Segment 'console is too narrow, 70+ columns recommended' 'Dim')
+        )
+    }
+
+    if (-not (Request-AccessCode -MaxAttempts $script:Config.MaxAccessAttempts)) {
+        Show-Dashboard
+        Write-Segments -Segments @(
+            (New-Segment '  ✖ ' 'Error'),
+            (New-Segment 'access denied' 'Error')
+        )
+        Wait-ExitKey
+        exit 1
+    }
+
+    # GitHub rejects legacy TLS defaults on Windows PowerShell 5.1.
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+    $tempRoot        = Join-Path ([System.IO.Path]::GetTempPath()) ('kikios_' + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $sevenZipPath    = Join-Path $tempRoot '7zr.exe'
+    $archivePath     = Join-Path $tempRoot $script:Config.ArchiveName
+    $destinationPath = Join-Path ([Environment]::GetFolderPath('Desktop')) $script:Config.DestinationFolder
 
     try {
-        Initialize-Console
+        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
-        $destination = Join-Path ([System.Environment]::GetFolderPath('Desktop')) $script:Config.DestinationName
-        Show-Dashboard -UserName $env:USERNAME -MachineName $env:COMPUTERNAME -DestinationPath ('Desktop\' + $script:Config.DestinationName)
+        Set-StepStatus -Index 0 -Status 'Running'
+        $sevenZipDuration = Invoke-DownloadStep -Url $script:Config.SevenZipUrl -DestinationPath $sevenZipPath -Activity 'Downloading 7-Zip...'
+        Set-StepStatus -Index 0 -Status 'Done' -SkipRender
+        Add-SuccessEntry -Message '7-Zip downloaded' -Duration $sevenZipDuration
 
-        if (-not (Request-AccessCode)) {
-            Write-Host ''
-            Write-Notice -Message 'Access denied. Nothing was installed.' -ColorKey 'Danger'
-            Start-Sleep -Seconds 2
-            return 1
+        Set-StepStatus -Index 1 -Status 'Running'
+        $archiveDuration = Invoke-DownloadStep -Url $script:Config.ArchiveUrl -DestinationPath $archivePath -Activity 'Downloading tweaks archive...'
+        Set-StepStatus -Index 1 -Status 'Done' -SkipRender
+        Add-SuccessEntry -Message 'Tweaks archive downloaded' -Duration $archiveDuration
+
+        Set-StepStatus -Index 2 -Status 'Running'
+        $extractDuration = Invoke-ExtractionStep -SevenZipPath $sevenZipPath -ArchivePath $archivePath -DestinationPath $destinationPath -LogDirectory $tempRoot -Activity 'Unpacking tweaks...'
+        Set-StepStatus -Index 2 -Status 'Done' -SkipRender
+        Add-SuccessEntry -Message ('Unpacked to Desktop\{0}' -f $script:Config.DestinationFolder) -Duration $extractDuration
+
+        Set-StepStatus -Index 3 -Status 'Running'
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Set-StepStatus -Index 3 -Status 'Done' -SkipRender
+        Add-SuccessEntry -Message 'Temporary files removed'
+    }
+    catch {
+        if ($script:CurrentStepIndex -ge 0) {
+            Set-StepStatus -Index $script:CurrentStepIndex -Status 'Failed' -SkipRender
         }
-
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-        $workingDirectory = Join-Path $env:TEMP ('kikios_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        New-Item -ItemType Directory -Path $workingDirectory | Out-Null
-
-        $extractorPath = Join-Path $workingDirectory '7zr.exe'
-        $archivePath = Join-Path $workingDirectory 'pcboost.7z'
-
-        Write-Host ''
-        Start-MascotStage
-
-        Invoke-MonitoredDownload -Uri $script:Config.ExtractorUri -Destination $extractorPath -SpeechLines @(
-            'First I grab a tiny unpacker.',
-            'One megabyte, do not blink.',
-            'Almost have it.'
-        ) -DoneSpeech 'Unpacker is mine.'
-
-        Invoke-MonitoredDownload -Uri $script:Config.ArchiveUri -Destination $archivePath -SpeechLines @(
-            'Now pulling your tweak pack.',
-            'This one is bigger, hold on.',
-            'Still coming down, I will keep hopping.'
-        ) -DoneSpeech 'Pack downloaded.'
-
-        Expand-TweakArchive -ExtractorPath $extractorPath -ArchivePath $archivePath -Destination $destination -SpeechLines @(
-            'Shaking everything out of the box.',
-            'Sorting your tweaks onto the Desktop.',
-            'Last few files, promise.'
-        ) -DoneSpeech 'Everything is in place.'
-
-        Write-Host ''
-        Write-Notice -Message ('Done. Your tweaks live in Desktop\' + $script:Config.DestinationName) -ColorKey 'Success'
-        return 0
+        Add-ActivityEntry -Segments @(
+            (New-Segment '  ✖ ' 'Error'),
+            (New-Segment $_.Exception.Message 'Error')
+        )
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Wait-ExitKey
+        exit 1
     }
-    catch [System.Net.WebException] {
-        Write-Host ''
-        Write-Notice -Message 'Download failed. Check the connection and run me again.' -ColorKey 'Danger'
-        return 2
-    }
-    catch [System.InvalidOperationException] {
-        Write-Host ''
-        Write-Notice -Message 'The archive would not open. Run me again.' -ColorKey 'Danger'
-        return 3
-    }
-    catch [System.IO.IOException] {
-        Write-Host ''
-        Write-Notice -Message 'A file was locked on disk. Close other apps and retry.' -ColorKey 'Danger'
-        return 4
-    }
-    catch [System.Exception] {
-        Write-Host ''
-        Write-Notice -Message ('Unexpected error: ' + $_.Exception.Message) -ColorKey 'Danger'
-        return 5
-    }
-    finally {
-        Remove-WorkingDirectory -Path $workingDirectory
-        Wait-ForExitKey
-        Set-CursorVisible -Visible $true
-    }
+
+    Add-SummaryEntry -Message ('KikiOS is ready: {0}' -f $destinationPath)
+    Wait-ExitKey
+    exit 0
 }
 
-exit (Invoke-Installer)
+Invoke-Installer
